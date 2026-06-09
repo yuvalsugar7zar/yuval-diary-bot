@@ -21,7 +21,10 @@ MEETINGS_FILE = f"{DATA_DIR}/meetings.json"
 MEMORY_FILE = f"{DATA_DIR}/memory.json"
 NOTES_FILE = f"{DATA_DIR}/notes.json"
 HISTORY_FILE = f"{DATA_DIR}/history.json"
+SUMMARY_FILE = f"{DATA_DIR}/summary.json"
+RECURRING_FILE = f"{DATA_DIR}/recurring.json"
 
+MAX_HISTORY = 200
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 def load_json(filename, default):
@@ -42,6 +45,29 @@ def load_notes(): return load_json(NOTES_FILE, [])
 def save_notes(d): save_json(NOTES_FILE, d)
 def load_history(): return load_json(HISTORY_FILE, [])
 def save_history(d): save_json(HISTORY_FILE, d)
+def load_recurring(): return load_json(RECURRING_FILE, [])
+def save_recurring(d): save_json(RECURRING_FILE, d)
+def load_summary(): return load_json(SUMMARY_FILE, {"text": "", "updated": ""})
+def save_summary(d): save_json(SUMMARY_FILE, d)
+
+def summarize_history(history):
+    if not history:
+        return ""
+    lines = [f"[{h['time']}] {h['role']}: {h['text']}" for h in history]
+    history_text = "\n".join(lines)
+    
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=500,
+        messages=[{"role": "user", "content": f"""סכם את השיחה הבאה בקצרה (עד 300 מילה).
+שמור על: פגישות שנדונו, החלטות חשובות, מידע אישי שהוזכר, נושאים עיקריים.
+
+שיחה:
+{history_text}
+
+סיכום:"""}]
+    )
+    return response.content[0].text.strip()
 
 def add_to_history(role, text):
     history = load_history()
@@ -50,36 +76,51 @@ def add_to_history(role, text):
         "text": text[:200],
         "time": datetime.now(ISRAEL_TZ).strftime("%d/%m/%Y %H:%M")
     })
-    if len(history) > 200:
-        history = history[-200:]
+    
+    if len(history) >= MAX_HISTORY:
+        logger.info("History full - summarizing...")
+        new_summary_text = summarize_history(history)
+        existing = load_summary()
+        if existing["text"]:
+            combined = f"{existing['text']}\n\nסיכום נוסף ({datetime.now(ISRAEL_TZ).strftime('%d/%m/%Y')}):\n{new_summary_text}"
+            final_summary = combined
+        else:
+            final_summary = new_summary_text
+        save_summary({"text": final_summary, "updated": datetime.now(ISRAEL_TZ).strftime("%d/%m/%Y %H:%M")})
+        history = []
+    
     save_history(history)
 
-def get_history_text():
+def get_context_text():
+    summary = load_summary()
     history = load_history()
-    if not history:
-        return "אין היסטוריה."
-    lines = []
-    for h in history[-40:]:
-        lines.append(f"[{h['time']}] {h['role']}: {h['text']}")
-    return "\n".join(lines)
+    
+    parts = []
+    if summary["text"]:
+        parts.append(f"סיכום שיחות קודמות:\n{summary['text']}")
+    if history:
+        lines = [f"[{h['time']}] {h['role']}: {h['text']}" for h in history[-40:]]
+        parts.append(f"שיחה נוכחית:\n" + "\n".join(lines))
+    
+    return "\n\n".join(parts) if parts else "אין היסטוריה."
 
 def get_meetings_text():
     meetings = load_meetings()
     if not meetings:
         return "אין פגישות."
-    lines = []
-    for i, m in enumerate(meetings):
-        lines.append(f"{i}. {m['date']} {m['time']} - {m['subject']} | מיקום: {m.get('location','לא צוין')}")
-    return "\n".join(lines)
+    return "\n".join([f"{i}. {m['date']} {m['time']} - {m['subject']} | מיקום: {m.get('location','לא צוין')}" for i, m in enumerate(meetings)])
 
 def get_notes_text():
     notes = load_notes()
     if not notes:
         return "אין פתקים."
-    lines = []
-    for i, n in enumerate(notes):
-        lines.append(f"{i}. [{n['time']}] {n['text']}")
-    return "\n".join(lines)
+    return "\n".join([f"{i}. [{n['time']}] {n['text']}" for i, n in enumerate(notes)])
+
+def get_recurring_text():
+    recurring = load_recurring()
+    if not recurring:
+        return "אין תזכורות חוזרות."
+    return "\n".join([f"{i}. {r['type']} - {r['text']} (שעה: {r.get('time','')})" for i, r in enumerate(recurring)])
 
 def format_meetings_list(meetings_list, title):
     if not meetings_list:
@@ -107,28 +148,31 @@ def process_message(user_text):
 כל הפתקים (עם מספר שורה):
 {get_notes_text()}
 
-היסטוריית שיחות:
-{get_history_text()}
+תזכורות חוזרות:
+{get_recurring_text()}
+
+היסטוריה ושיחות קודמות:
+{get_context_text()}
 
 המשתמש כתב: "{user_text}"
 
 ענה ב-JSON בלבד (ללא markdown):
 {{
-  "action": "add_meeting|delete_meeting|edit_meeting|list_today|list_tomorrow|list_week|list_all|add_note|list_notes|delete_note|save_memory|chat",
+  "action": "add_meeting|delete_meeting|edit_meeting|list_today|list_tomorrow|list_week|list_all|add_note|list_notes|delete_note|save_memory|add_recurring|list_recurring|delete_recurring|chat",
   "response": "תשובה בעברית למשתמש",
   "data": {{}}
 }}
 
-כללים לכל action:
+כללים:
 - add_meeting: data={{"date":"DD/MM/YYYY","time":"HH:MM","location":"","subject":""}}
-- delete_meeting: data={{"index":מספר}} (הפגישה האחרונה = מספר הפגישה האחרונה ברשימה)
+- delete_meeting: data={{"index":מספר}}
 - edit_meeting: data={{"index":מספר,"field":"time|location|subject|date","value":"ערך חדש"}}
-- list_today/list_tomorrow/list_week/list_all: data={{}}
-- add_note: data={{"text":"","topic":""}} (לעסקאות/הסכמות/מידע חשוב)
-- list_notes: data={{"topic":"סינון לפי נושא או ריק"}}
+- add_note: data={{"text":"","topic":""}}
+- list_notes: data={{"topic":""}}
 - delete_note: data={{"index":מספר}}
-- save_memory: data={{"key":"","value":""}} (לשמור שם/עיר/מידע אישי)
-- chat: לכל שאלה אחרת, שימוש בהיסטוריה ובזיכרון לתשובה
+- save_memory: data={{"key":"","value":""}}
+- add_recurring: data={{"type":"daily|monthly|day_of_week","text":"","time":"HH:MM","day":"מספר"}}
+- delete_recurring: data={{"index":מספר}}
 
 תאריכים:
 - היום={now.strftime('%d/%m/%Y')}
@@ -147,7 +191,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     text = update.message.text
     add_to_history("משתמש", text)
-    await update.message.reply_text("⏳ מעבד...")
 
     try:
         result = process_message(text)
@@ -158,6 +201,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         meetings = load_meetings()
         notes = load_notes()
         memory = load_memory()
+        recurring = load_recurring()
         now = datetime.now(ISRAEL_TZ)
 
         if action == "add_meeting":
@@ -171,6 +215,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
             meetings.append(meeting)
             save_meetings(meetings)
+            resp = f"✅ *פגישה נוספה!*\n\n📅 תאריך: {meeting['date']}\n🕐 שעה: {meeting['time']}\n📋 נושא: {meeting['subject']}"
+            if meeting["location"]:
+                resp += f"\n📍 מיקום: {meeting['location']}"
+            resp += "\n\n🔔 אזכיר לך שעתיים לפני!"
 
         elif action == "delete_meeting":
             idx = int(data.get("index", -1))
@@ -179,7 +227,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 save_meetings(meetings)
                 resp = f"🗑️ נמחקה: *{deleted['subject']}* ב-{deleted['date']} {deleted['time']}"
             else:
-                resp = "❌ לא מצאתי את הפגישה. שאל 'מה הפגישות שלי?' כדי לראות את הרשימה."
+                resp = "❌ לא מצאתי. שאל 'מה הפגישות שלי?' לראות רשימה."
 
         elif action == "edit_meeting":
             idx = int(data.get("index", -1))
@@ -191,14 +239,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if field in ["date", "time"]:
                     meetings[idx]["reminded"] = False
                 save_meetings(meetings)
-                resp = f"✅ עודכן! *{meetings[idx]['subject']}*\n{field}: {old_val} ➜ {value}"
+                resp = f"✅ עודכן!\n*{meetings[idx]['subject']}*\n{field}: {old_val} ➜ {value}"
             else:
-                resp = "❌ לא הצלחתי לעדכן. נסה שוב עם פרטים יותר ברורים."
+                resp = "❌ לא הצלחתי לעדכן. נסה שוב."
 
         elif action == "list_today":
             today = now.strftime("%d/%m/%Y")
             filtered = [m for m in meetings if m["date"] == today]
-            # גם רק פגישות עתידיות להיום
             resp = format_meetings_list(filtered, f"📅 *לו\"ז להמשך היום ({today}):*")
 
         elif action == "list_tomorrow":
@@ -222,6 +269,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
             notes.append(note)
             save_notes(notes)
+            resp = f"📝 *נשמר!*\n\n{note['text']}\n\n🕐 {note['time']}"
 
         elif action == "list_notes":
             topic = data.get("topic", "")
@@ -240,8 +288,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 notes.pop(idx)
                 save_notes(notes)
                 resp = "✅ הפתק נמחק!"
-            else:
-                resp = "❌ לא מצאתי את הפתק."
 
         elif action == "save_memory":
             key = data.get("key", "")
@@ -249,6 +295,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if key:
                 memory[key] = value
                 save_memory(memory)
+            resp = f"✅ זכרתי: {value}"
+
+        elif action == "add_recurring":
+            rec = {
+                "type": data.get("type", "monthly"),
+                "text": data.get("text", ""),
+                "time": data.get("time", "09:00"),
+                "day": str(data.get("day", "1")),
+                "user_id": user_id
+            }
+            recurring.append(rec)
+            save_recurring(recurring)
+            resp = f"✅ *תזכורת חוזרת נוספה!*\n\n🔔 {rec['text']}\n⏰ {rec['type']} בשעה {rec['time']}"
+
+        elif action == "list_recurring":
+            if not recurring:
+                resp = "אין תזכורות חוזרות."
+            else:
+                lines = ["🔔 *תזכורות חוזרות:*", ""]
+                for i, r in enumerate(recurring):
+                    lines.append(f"{i+1}. {r['text']} - {r['type']} בשעה {r.get('time','')}")
+                resp = "\n".join(lines)
+
+        elif action == "delete_recurring":
+            idx = int(data.get("index", -1))
+            if 0 <= idx < len(recurring):
+                recurring.pop(idx)
+                save_recurring(recurring)
+                resp = "✅ התזכורת החוזרת נמחקה!"
 
         add_to_history("בוט", resp)
         await update.message.reply_text(resp, parse_mode="Markdown")
@@ -267,7 +342,7 @@ async def send_daily_schedule(context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(chat_id=int(user_id), text=msg, parse_mode="Markdown")
         except Exception as e:
-            logger.error(f"Daily schedule error: {e}")
+            logger.error(f"Daily error: {e}")
 
 async def send_weekly_schedule(context: ContextTypes.DEFAULT_TYPE):
     meetings = load_meetings()
@@ -280,7 +355,7 @@ async def send_weekly_schedule(context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(chat_id=int(user_id), text=msg, parse_mode="Markdown")
         except Exception as e:
-            logger.error(f"Weekly schedule error: {e}")
+            logger.error(f"Weekly error: {e}")
 
 async def send_reminders(context: ContextTypes.DEFAULT_TYPE):
     meetings = load_meetings()
@@ -305,28 +380,38 @@ async def send_reminders(context: ContextTypes.DEFAULT_TYPE):
     if changed:
         save_meetings(meetings)
 
+async def check_recurring(context: ContextTypes.DEFAULT_TYPE):
+    recurring = load_recurring()
+    now = datetime.now(ISRAEL_TZ)
+    current_hm = now.strftime("%H:%M")
+    for rec in recurring:
+        if current_hm != rec.get("time", "09:00"):
+            continue
+        send = False
+        rec_type = rec.get("type", "")
+        rec_day = str(rec.get("day", "1"))
+        if rec_type == "daily":
+            send = True
+        elif rec_type == "monthly" and str(now.day) == rec_day:
+            send = True
+        elif rec_type == "day_of_week":
+            day_map = {"0": 6, "1": 0, "2": 1, "3": 2, "4": 3, "5": 4, "6": 5}
+            if day_map.get(rec_day, -1) == now.weekday():
+                send = True
+        if send:
+            try:
+                await context.bot.send_message(chat_id=int(rec["user_id"]), text=f"🔔 *תזכורת:*\n{rec['text']}", parse_mode="Markdown")
+            except Exception as e:
+                logger.error(f"Recurring error: {e}")
+
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    job_queue = app.job_queue
-
-    # לוז יומי ב-21:00
-    job_queue.run_daily(
-        send_daily_schedule,
-        time=datetime.strptime("21:00", "%H:%M").replace(tzinfo=ISRAEL_TZ).timetz()
-    )
-
-    # לוז שבועי בשבת ב-09:00
-    job_queue.run_daily(
-        send_weekly_schedule,
-        time=datetime.strptime("09:00", "%H:%M").replace(tzinfo=ISRAEL_TZ).timetz(),
-        days=(5,)  # שבת
-    )
-
-    # תזכורות כל 5 דקות
-    job_queue.run_repeating(send_reminders, interval=300, first=10)
-
+    jq = app.job_queue
+    jq.run_daily(send_daily_schedule, time=datetime.strptime("21:00", "%H:%M").replace(tzinfo=ISRAEL_TZ).timetz())
+    jq.run_daily(send_weekly_schedule, time=datetime.strptime("21:00", "%H:%M").replace(tzinfo=ISRAEL_TZ).timetz(), days=(5,))
+    jq.run_repeating(send_reminders, interval=300, first=10)
+    jq.run_repeating(check_recurring, interval=60, first=5)
     logger.info("Bot started!")
     app.run_polling()
 
