@@ -47,6 +47,26 @@ REMINDERS_FILE = f"{DATA_DIR}/reminders.json"
 MAX_HISTORY = 200
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
+def get_archive_file(year): return f"{DATA_DIR}/archive_{year}.json"
+def load_archive(year): return load_json(get_archive_file(year), None)
+def save_archive(year, data): save_json(get_archive_file(year), data)
+
+def search_in_archive(archive, query):
+    results = {"meetings": [], "notes": [], "summary": ""}
+    query_lower = query.lower()
+    for m in archive.get("meetings", []):
+        if (query in m.get("date", "") or
+            query_lower in m.get("subject", "").lower() or
+            query_lower in m.get("location", "").lower()):
+            results["meetings"].append(m)
+    for n in archive.get("notes", []):
+        if (query in n.get("time", "") or
+            query_lower in n.get("text", "").lower() or
+            query_lower in n.get("topic", "").lower()):
+            results["notes"].append(n)
+    results["summary"] = archive.get("summary", "")
+    return results
+
 def load_json(filename, default):
     try:
         if os.path.exists(filename):
@@ -137,7 +157,7 @@ def add_to_history(role, text):
         )
         existing = load_summary().get("text", "")
         new_text = (existing + "\n" + resp.content[0].text.strip()).strip()
-        save_summary({"text": new_text[-3000:]})
+        save_summary({"text": new_text[-100000:]})
         history = []
     save_history(history)
 
@@ -196,7 +216,7 @@ def classify_message(user_text):
 הודעה: {user_text}
 
 סווג לאחת מהפעולות:
-add_meeting, delete_meeting, edit_meeting, list_today, list_tomorrow, list_week, list_all, add_note, list_notes, delete_note, save_memory, add_recurring, list_recurring, delete_recurring, add_reminder, stats, chat
+add_meeting, delete_meeting, edit_meeting, list_today, list_tomorrow, list_week, list_all, add_note, list_notes, delete_note, save_memory, add_recurring, list_recurring, delete_recurring, add_reminder, stats, export_year, search_archive, chat
 
 חוקים:
 - add_meeting: date,time,location,subject. אם ביקש תזכורת נוספת שים extra_reminder=מספר דקות
@@ -204,6 +224,8 @@ add_meeting, delete_meeting, edit_meeting, list_today, list_tomorrow, list_week,
 - save_memory: mem_key,mem_value
 - add_note: note_text,note_topic
 - list_notes: note_topic לסינון או ריק
+- export_year: שנה לייצוא (ברירת מחדל: השנה הנוכחית) -> שים בשדה "value" את השנה
+- search_archive: חיפוש בארכיון -> שים בשדה "value" את השנה ובשדה "note_text" את מה לחפש
 
 תאריכים: היום={now.strftime('%d/%m/%Y')}, מחר={(now+timedelta(days=1)).strftime('%d/%m/%Y')}
 
@@ -317,7 +339,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if m["location"]:
                 resp += f"\n📍 {m['location']}"
             resp += "\n\n🔔 אזכיר לך שעתיים לפני!"
-            if extra > 0 and extra != 120:
+            if extra > 0:
                 resp += f"\n🔔 וגם {extra} דקות לפני!"
             if cal_event_id:
                 resp += "\n📅 נוסף לגוגל קלנדר!"
@@ -469,6 +491,59 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 save_recurring(recurring)
                 resp = "✅ נמחק!"
 
+        elif action == "export_year":
+            year = str(r.get("value", "") or datetime.now(ISRAEL_TZ).year)
+            archive_data = {
+                "year": year,
+                "exported_at": now.strftime("%d/%m/%Y %H:%M"),
+                "summary": load_summary().get("text", ""),
+                "meetings": [m for m in meetings if m.get("date", "").endswith(f"/{year}")],
+                "notes": [n for n in notes if n.get("time", "").endswith(f"/{year}") or f"/{year}" in n.get("time", "")],
+                "memory": load_memory()
+            }
+            filename = f"{DATA_DIR}/archive_{year}.json"
+            save_json(filename, archive_data)
+            with open(filename, "rb") as f:
+                await update.message.reply_document(
+                    document=f,
+                    filename=f"yuval_diary_{year}.json",
+                    caption=f"📦 *ארכיון {year}*\n\n📅 פגישות: {len(archive_data['meetings'])}\n📝 פתקים: {len(archive_data['notes'])}\n\nשמור את הקובץ על המחשב שלך!"
+                )
+            add_to_history("בוט", f"ייצוא ארכיון {year}")
+            return
+
+        elif action == "search_archive":
+            year = str(r.get("value", "") or datetime.now(ISRAEL_TZ).year)
+            query = r.get("note_text", "")
+            archive = load_archive(year)
+            if not archive:
+                resp = f"❌ אין ארכיון לשנת {year}.\nשלח את קובץ yuval_diary_{year}.json כדי לטעון אותו."
+            else:
+                results = search_in_archive(archive, query)
+                if not results["meetings"] and not results["notes"]:
+                    resp = f"🔍 לא מצאתי תוצאות עבור *{query}* בשנת {year}."
+                else:
+                    lines = [f"🔍 *תוצאות עבור '{query}' בשנת {year}:*", ""]
+                    if results["meetings"]:
+                        lines.append("📅 *פגישות:*")
+                        for m in results["meetings"][:10]:
+                            lines.append(f"  • {m['date']} {m['time']} - {m['subject']}")
+                    if results["notes"]:
+                        lines.append("\n📝 *פתקים:*")
+                        for n in results["notes"][:10]:
+                            has_img = " 📷" if n.get("image_url") else ""
+                            lines.append(f"  • [{n['time']}] {n['text'][:80]}{has_img}")
+                    # שלח ל-Claude לסיכום
+                    summary_prompt = f"תסכם בקצרה את הממצאים הבאים מהחיפוש '{query}' בשנת {year}:\n" + "\n".join(lines[2:])
+                    claude_resp = client.messages.create(
+                        model="claude-haiku-4-5-20251001",
+                        max_tokens=300,
+                        messages=[{"role": "user", "content": summary_prompt}]
+                    )
+                    lines.append("\n💬 *סיכום:*")
+                    lines.append(claude_resp.content[0].text.strip())
+                    resp = "\n".join(lines)
+
         elif action == "stats":
             history = load_history()
             notes_with_img = len([n for n in notes if n.get("image_url")])
@@ -593,10 +668,41 @@ async def check_recurring(context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"Recurring error: {e}")
 
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """קבלת קובץ ארכיון JSON מהמשתמש"""
+    doc = update.message.document
+    if not doc or not doc.file_name.endswith(".json"):
+        await update.message.reply_text("❌ שלח קובץ JSON בלבד.")
+        return
+    if not doc.file_name.startswith("yuval_diary_"):
+        await update.message.reply_text("❌ שם הקובץ חייב להיות בפורמט: yuval_diary_YYYY.json")
+        return
+    try:
+        year = doc.file_name.replace("yuval_diary_", "").replace(".json", "")
+        file = await context.bot.get_file(doc.file_id)
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.get(file.file_path) as resp:
+                data = await resp.json(content_type=None)
+        save_archive(year, data)
+        meetings_count = len(data.get("meetings", []))
+        notes_count = len(data.get("notes", []))
+        await update.message.reply_text(
+            f"✅ *ארכיון {year} נטען בהצלחה!*\n\n"
+            f"📅 פגישות: {meetings_count}\n"
+            f"📝 פתקים: {notes_count}\n\n"
+            f"עכשיו תוכל לשאול: *'חפש בארכיון {year} פגישה עם דני'*",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Document error: {e}")
+        await update.message.reply_text("❌ לא הצלחתי לטעון את הקובץ. נסה שוב.")
+
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.MimeType('application/json'), handle_document))
     jq = app.job_queue
     jq.run_daily(send_daily_schedule, time=datetime.strptime("21:00", "%H:%M").replace(tzinfo=ISRAEL_TZ).timetz())
     jq.run_daily(send_weekly_schedule, time=datetime.strptime("21:00", "%H:%M").replace(tzinfo=ISRAEL_TZ).timetz(), days=(5,))
