@@ -317,7 +317,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if m["location"]:
                 resp += f"\n📍 {m['location']}"
             resp += "\n\n🔔 אזכיר לך שעתיים לפני!"
-            if extra > 0:
+            if extra > 0 and extra != 120:
                 resp += f"\n🔔 וגם {extra} דקות לפני!"
             if cal_event_id:
                 resp += "\n📅 נוסף לגוגל קלנדר!"
