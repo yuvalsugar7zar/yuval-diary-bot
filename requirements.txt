@@ -3,3 +3,6 @@ anthropic>=0.40.0
 pytz==2024.1
 cloudinary>=1.36.0
 aiohttp>=3.9.0
+google-auth>=2.0.0
+google-auth-httplib2>=0.1.0
+google-api-python-client>=2.0.0

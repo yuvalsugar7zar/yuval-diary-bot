@@ -9,6 +9,11 @@ import cloudinary.uploader
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 import anthropic
+import base64
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -19,6 +24,8 @@ CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME")
 CLOUDINARY_API_KEY = os.environ.get("CLOUDINARY_API_KEY")
 CLOUDINARY_API_SECRET = os.environ.get("CLOUDINARY_API_SECRET")
 ISRAEL_TZ = pytz.timezone("Asia/Jerusalem")
+GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "")
+GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS", "")
 
 cloudinary.config(
     cloud_name=CLOUDINARY_CLOUD_NAME,
@@ -66,6 +73,52 @@ def save_recurring(d): save_json(RECURRING_FILE, d)
 def load_summary(): return load_json(SUMMARY_FILE, {"text": ""})
 def save_summary(d): save_json(SUMMARY_FILE, d)
 def load_reminders(): return load_json(REMINDERS_FILE, [])
+
+def get_calendar_service():
+    try:
+        creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+        creds = service_account.Credentials.from_service_account_info(
+            creds_dict,
+            scopes=["https://www.googleapis.com/auth/calendar"]
+        )
+        return build("calendar", "v3", credentials=creds)
+    except Exception as e:
+        logger.error(f"Calendar service error: {e}")
+        return None
+
+def add_to_google_calendar(meeting):
+    try:
+        service = get_calendar_service()
+        if not service or not GOOGLE_CALENDAR_ID:
+            return None
+        
+        date = meeting["date"]
+        time = meeting["time"]
+        dt_start = datetime.strptime(f"{date} {time}", "%d/%m/%Y %H:%M")
+        dt_start = ISRAEL_TZ.localize(dt_start)
+        dt_end = dt_start + timedelta(hours=1)
+        
+        event = {
+            "summary": meeting["subject"],
+            "location": meeting.get("location", ""),
+            "start": {"dateTime": dt_start.isoformat(), "timeZone": "Asia/Jerusalem"},
+            "end": {"dateTime": dt_end.isoformat(), "timeZone": "Asia/Jerusalem"},
+        }
+        
+        result = service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
+        return result.get("id")
+    except Exception as e:
+        logger.error(f"Google Calendar add error: {e}")
+        return None
+
+def delete_from_google_calendar(event_id):
+    try:
+        service = get_calendar_service()
+        if not service or not event_id:
+            return
+        service.events().delete(calendarId=GOOGLE_CALENDAR_ID, eventId=event_id).execute()
+    except Exception as e:
+        logger.error(f"Google Calendar delete error: {e}")
 def save_reminders(d): save_json(REMINDERS_FILE, d)
 
 def add_to_history(role, text):
@@ -255,18 +308,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
             meetings.append(m)
             save_meetings(meetings)
+            # סנכרון עם גוגל קלנדר
+            cal_event_id = add_to_google_calendar(m)
+            if cal_event_id:
+                meetings[-1]["google_event_id"] = cal_event_id
+                save_meetings(meetings)
             resp = f"✅ *פגישה נוספה!*\n\n📅 {m['date']}\n🕐 {m['time']}\n📋 {m['subject']}"
             if m["location"]:
                 resp += f"\n📍 {m['location']}"
             resp += "\n\n🔔 אזכיר לך שעתיים לפני!"
             if extra > 0:
                 resp += f"\n🔔 וגם {extra} דקות לפני!"
+            if cal_event_id:
+                resp += "\n📅 נוסף לגוגל קלנדר!"
 
         elif action == "delete_meeting":
             idx = int(r.get("index", -1))
             if 0 <= idx < len(meetings):
                 deleted = meetings.pop(idx)
                 save_meetings(meetings)
+                # מחק מגוגל קלנדר
+                if deleted.get("google_event_id"):
+                    delete_from_google_calendar(deleted["google_event_id"])
                 resp = f"🗑️ נמחקה: *{deleted['subject']}* ב-{deleted['date']} {deleted['time']}"
             else:
                 resp = "❌ לא מצאתי. שאל 'מה הפגישות שלי?' לראות רשימה."
