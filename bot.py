@@ -143,7 +143,7 @@ def classify_message(user_text):
 הודעה: {user_text}
 
 סווג לאחת מהפעולות:
-add_meeting, delete_meeting, edit_meeting, list_today, list_tomorrow, list_week, list_all, add_note, list_notes, delete_note, save_memory, add_recurring, list_recurring, delete_recurring, add_reminder, chat
+add_meeting, delete_meeting, edit_meeting, list_today, list_tomorrow, list_week, list_all, add_note, list_notes, delete_note, save_memory, add_recurring, list_recurring, delete_recurring, add_reminder, stats, chat
 
 חוקים:
 - add_meeting: date,time,location,subject. אם ביקש תזכורת נוספת שים extra_reminder=מספר דקות
@@ -317,13 +317,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not filtered:
                 resp = "📝 אין פתקים."
             else:
+                # שלח טקסט קודם
                 lines = ["📝 *פתקים:*", ""]
                 for n in filtered:
                     line = f"[{n['time']}] {n['text']}"
-                    if n.get("image_url"):
-                        line += f"\n📷 {n['image_url']}"
                     lines.append(line)
                 resp = "\n".join(lines)
+                await update.message.reply_text(resp, parse_mode="Markdown")
+                # שלח תמונות בנפרד
+                for n in filtered:
+                    if n.get("image_url"):
+                        await update.message.reply_photo(
+                            photo=n["image_url"],
+                            caption=f"📷 {n['text']} [{n['time']}]"
+                        )
+                add_to_history("בוט", resp)
+                return
 
         elif action == "delete_note":
             idx = int(r.get("index", -1))
@@ -396,6 +405,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 recurring.pop(idx)
                 save_recurring(recurring)
                 resp = "✅ נמחק!"
+
+        elif action == "stats":
+            history = load_history()
+            notes_with_img = len([n for n in notes if n.get("image_url")])
+            summary = load_summary().get("text", "")
+            resp = f"📊 *סטטיסטיקות:*\n\n"
+            resp += f"📅 פגישות: {len(meetings)}\n"
+            resp += f"📝 פתקים: {len(notes)}"
+            if notes_with_img > 0:
+                resp += f" (מתוכם {notes_with_img} עם תמונות)"
+            resp += f"\n💬 הודעות בהיסטוריה: {len(history)}/{MAX_HISTORY}\n"
+            resp += f"🔔 תזכורות חוזרות: {len(recurring)}\n"
+            resp += f"🧠 סיכומים: {'יש ✅' if summary else 'אין עדיין'}\n"
+            pending = [r for r in reminders if not r.get('sent')]
+            resp += f"⏰ תזכורות ממתינות: {len(pending)}"
 
         add_to_history("בוט", resp)
         await update.message.reply_text(resp, parse_mode="Markdown")
