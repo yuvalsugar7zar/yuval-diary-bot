@@ -4,6 +4,8 @@ import re
 import logging
 from datetime import datetime, timedelta
 import pytz
+import cloudinary
+import cloudinary.uploader
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 import anthropic
@@ -13,7 +15,16 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME")
+CLOUDINARY_API_KEY = os.environ.get("CLOUDINARY_API_KEY")
+CLOUDINARY_API_SECRET = os.environ.get("CLOUDINARY_API_SECRET")
 ISRAEL_TZ = pytz.timezone("Asia/Jerusalem")
+
+cloudinary.config(
+    cloud_name=CLOUDINARY_CLOUD_NAME,
+    api_key=CLOUDINARY_API_KEY,
+    api_secret=CLOUDINARY_API_SECRET
+)
 
 DATA_DIR = "/data"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -87,7 +98,13 @@ def get_notes_text():
     notes = load_notes()
     if not notes:
         return "אין פתקים"
-    return "\n".join([f"{i}. [{n['time']}] {n['text']}" for i, n in enumerate(notes)])
+    lines = []
+    for i, n in enumerate(notes):
+        line = f"{i}. [{n['time']}] {n['text']}"
+        if n.get("image_url"):
+            line += " 📷"
+        lines.append(line)
+    return "\n".join(lines)
 
 def get_context():
     parts = []
@@ -109,7 +126,7 @@ def format_meetings_list(meetings_list, title):
             lines.append(f"   📍 {m['location']}")
     return "\n".join(lines)
 
-def classify_message(user_text, user_id):
+def classify_message(user_text):
     now = datetime.now(ISRAEL_TZ)
     memory = load_memory()
 
@@ -129,13 +146,11 @@ def classify_message(user_text, user_id):
 add_meeting, delete_meeting, edit_meeting, list_today, list_tomorrow, list_week, list_all, add_note, list_notes, delete_note, save_memory, add_recurring, list_recurring, delete_recurring, add_reminder, chat
 
 חוקים:
-- add_meeting: מלא date,time,location,subject. אם ביקש תזכורת נוספת (למשל "גם 15 דקות לפני") שים extra_reminder=15
-- add_reminder: תזכורת חד-פעמית! 
-  "תזכיר לי בעוד 15 דקות לצאת" -> reminder_minutes=15, reminder_text="לצאת מהבית"
-  "תזכיר לי ב-11:15 לצאת" -> reminder_time="11:15", reminder_text="לצאת מהבית"
-- save_memory: mem_key ו-mem_value
-- add_note: note_text ו-note_topic
-- add_recurring: rec_type,rec_text,rec_time,rec_day
+- add_meeting: date,time,location,subject. אם ביקש תזכורת נוספת שים extra_reminder=מספר דקות
+- add_reminder: "בעוד X דקות" -> reminder_minutes=X | "ב-HH:MM" -> reminder_time="HH:MM"
+- save_memory: mem_key,mem_value
+- add_note: note_text,note_topic
+- list_notes: note_topic לסינון או ריק
 
 תאריכים: היום={now.strftime('%d/%m/%Y')}, מחר={(now+timedelta(days=1)).strftime('%d/%m/%Y')}
 
@@ -163,13 +178,59 @@ add_meeting, delete_meeting, edit_meeting, list_today, list_tomorrow, list_week,
         logger.error(f"JSON parse failed: {raw[:200]}")
         return {"action": "chat", "response": raw[:300], "index": -1}
 
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    caption = update.message.caption or ""
+    
+    try:
+        # הורד תמונה מטלגרם
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        
+        # העלה ל-Cloudinary
+        import tempfile
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.get(file.file_path) as resp:
+                img_data = await resp.read()
+        
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            tmp.write(img_data)
+            tmp_path = tmp.name
+        
+        result = cloudinary.uploader.upload(tmp_path, folder="yuval_diary")
+        os.unlink(tmp_path)
+        
+        image_url = result["secure_url"]
+        
+        # שמור פתק עם תמונה
+        now = datetime.now(ISRAEL_TZ)
+        note = {
+            "text": caption if caption else "תמונה",
+            "topic": "",
+            "time": now.strftime("%d/%m/%Y %H:%M"),
+            "image_url": image_url
+        }
+        notes = load_notes()
+        notes.append(note)
+        save_notes(notes)
+        
+        resp = f"📷 *תמונה נשמרה!*\n\n📝 {note['text']}\n🕐 {note['time']}"
+        add_to_history("משתמש", f"[תמונה] {caption}")
+        add_to_history("בוט", resp)
+        await update.message.reply_text(resp, parse_mode="Markdown")
+        
+    except Exception as e:
+        logger.error(f"Photo error: {e}")
+        await update.message.reply_text("❌ לא הצלחתי לשמור את התמונה. נסה שוב.")
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     text = update.message.text
     add_to_history("משתמש", text)
 
     try:
-        r = classify_message(text, user_id)
+        r = classify_message(text)
         action = r.get("action", "chat")
         resp = r.get("response", "")
 
@@ -258,7 +319,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 lines = ["📝 *פתקים:*", ""]
                 for n in filtered:
-                    lines.append(f"[{n['time']}] {n['text']}")
+                    line = f"[{n['time']}] {n['text']}"
+                    if n.get("image_url"):
+                        line += f"\n📷 {n['image_url']}"
+                    lines.append(line)
                 resp = "\n".join(lines)
 
         elif action == "delete_note":
@@ -376,7 +440,6 @@ async def send_reminders(context: ContextTypes.DEFAULT_TYPE):
             meeting_dt = ISRAEL_TZ.localize(meeting_dt)
             diff = (meeting_dt - now).total_seconds() / 60
 
-            # תזכורת שעתיים לפני
             if not meeting.get("reminded") and 110 <= diff <= 130:
                 msg = f"🔔 *תזכורת!*\n\nבעוד שעתיים:\n📋 *{meeting['subject']}*\n🕐 {meeting['time']}"
                 if meeting.get("location"):
@@ -385,7 +448,6 @@ async def send_reminders(context: ContextTypes.DEFAULT_TYPE):
                 meeting["reminded"] = True
                 changed = True
 
-            # תזכורת נוספת לפי בקשה
             extra = int(meeting.get("extra_reminder_minutes", 0))
             if extra > 0 and not meeting.get("extra_reminded") and (extra - 3) <= diff <= (extra + 3):
                 msg = f"🔔 *תזכורת!*\n\nבעוד {extra} דקות:\n📋 *{meeting['subject']}*\n🕐 {meeting['time']}"
@@ -401,7 +463,6 @@ async def send_reminders(context: ContextTypes.DEFAULT_TYPE):
     if changed:
         save_meetings(meetings)
 
-    # תזכורות חד-פעמיות
     reminders = load_reminders()
     changed_r = False
     for reminder in reminders:
@@ -410,7 +471,7 @@ async def send_reminders(context: ContextTypes.DEFAULT_TYPE):
         try:
             fire_at = datetime.strptime(reminder["fire_at"], "%d/%m/%Y %H:%M")
             fire_at = ISRAEL_TZ.localize(fire_at)
-            if abs((fire_at - now).total_seconds()) <= 150:
+            if abs((fire_at - now).total_seconds()) <= 90:
                 msg = f"🔔 *תזכורת!*\n\n{reminder['text']}"
                 await context.bot.send_message(chat_id=int(reminder["user_id"]), text=msg, parse_mode="Markdown")
                 reminder["sent"] = True
@@ -448,6 +509,7 @@ async def check_recurring(context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     jq = app.job_queue
     jq.run_daily(send_daily_schedule, time=datetime.strptime("21:00", "%H:%M").replace(tzinfo=ISRAEL_TZ).timetz())
     jq.run_daily(send_weekly_schedule, time=datetime.strptime("21:00", "%H:%M").replace(tzinfo=ISRAEL_TZ).timetz(), days=(5,))
