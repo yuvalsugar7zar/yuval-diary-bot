@@ -199,6 +199,32 @@ def format_meetings_list(meetings_list, title):
             lines.append(f"   📍 {m['location']}")
     return "\n".join(lines)
 
+def get_next_weekday(weekday_name):
+    """מחזיר את התאריך של היום הבא לפי שם היום בעברית"""
+    days_he = {
+        "ראשון": 6, "שני": 0, "שלישי": 1, "רביעי": 2,
+        "חמישי": 3, "שישי": 4, "שבת": 5
+    }
+    now = datetime.now(ISRAEL_TZ)
+    target = days_he.get(weekday_name, -1)
+    if target == -1:
+        return None
+    days_ahead = (target - now.weekday()) % 7
+    if days_ahead == 0:
+        days_ahead = 7  # אם היום הוא אותו יום, קח את השבוע הבא
+    return (now + timedelta(days=days_ahead)).strftime("%d/%m/%Y")
+
+def get_dates_context():
+    """מחזיר הקשר תאריכים מפורט"""
+    now = datetime.now(ISRAEL_TZ)
+    days_he = ["שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת", "ראשון"]
+    lines = [f"היום: {now.strftime('%d/%m/%Y')} ({days_he[now.weekday()]})"]
+    lines.append(f"מחר: {(now + timedelta(days=1)).strftime('%d/%m/%Y')} ({days_he[(now.weekday()+1)%7]})")
+    for i in range(2, 8):
+        d = now + timedelta(days=i)
+        lines.append(f"יום {days_he[d.weekday()]}: {d.strftime('%d/%m/%Y')}")
+    return "\n".join(lines)
+
 def classify_message(user_text):
     now = datetime.now(ISRAEL_TZ)
     memory = load_memory()
@@ -227,7 +253,9 @@ add_meeting, delete_meeting, edit_meeting, list_today, list_tomorrow, list_week,
 - export_year: שנה לייצוא (ברירת מחדל: השנה הנוכחית) -> שים בשדה "value" את השנה
 - search_archive: חיפוש בארכיון -> שים בשדה "value" את השנה ובשדה "note_text" את מה לחפש
 
-תאריכים: היום={now.strftime('%d/%m/%Y')}, מחר={(now+timedelta(days=1)).strftime('%d/%m/%Y')}
+תאריכים מפורטים:
+{get_dates_context()}
+חשוב: כשכותבים "ביום חמישי" - השתמש בתאריך המדויק מהרשימה למעלה!
 
 ענה JSON בלבד:"""
 
@@ -339,7 +367,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if m["location"]:
                 resp += f"\n📍 {m['location']}"
             resp += "\n\n🔔 אזכיר לך שעתיים לפני!"
-            if extra > 0:
+            if extra > 0 and extra != 120:
                 resp += f"\n🔔 וגם {extra} דקות לפני!"
             if cal_event_id:
                 resp += "\n📅 נוסף לגוגל קלנדר!"
@@ -367,13 +395,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     meetings[idx]["reminded"] = False
                     meetings[idx]["extra_reminded"] = False
                 save_meetings(meetings)
+                # עדכון גוגל קלנדר
+                event_id = meetings[idx].get("google_event_id")
+                if event_id:
+                    try:
+                        service = get_calendar_service()
+                        if service:
+                            event = service.events().get(calendarId=GOOGLE_CALENDAR_ID, eventId=event_id).execute()
+                            date = meetings[idx].get("date", "")
+                            time = meetings[idx].get("time", "")
+                            dt_start = datetime.strptime(f"{date} {time}", "%d/%m/%Y %H:%M")
+                            dt_start = ISRAEL_TZ.localize(dt_start)
+                            dt_end = dt_start + timedelta(hours=1)
+                            event["summary"] = meetings[idx].get("subject", event.get("summary",""))
+                            event["location"] = meetings[idx].get("location", "")
+                            event["start"] = {"dateTime": dt_start.isoformat(), "timeZone": "Asia/Jerusalem"}
+                            event["end"] = {"dateTime": dt_end.isoformat(), "timeZone": "Asia/Jerusalem"}
+                            service.events().update(calendarId=GOOGLE_CALENDAR_ID, eventId=event_id, body=event).execute()
+                    except Exception as e:
+                        logger.error(f"Google Calendar update error: {e}")
                 resp = f"✅ עודכן!\n*{meetings[idx]['subject']}*\n{field}: {old_val} ➜ {value}"
+                if event_id:
+                    resp += "\n📅 גוגל קלנדר עודכן!"
             else:
                 resp = "❌ לא הצלחתי לעדכן."
 
         elif action == "list_today":
             today = now.strftime("%d/%m/%Y")
-            resp = format_meetings_list([m for m in meetings if m["date"] == today], f"📅 *היום ({today}):*")
+            today_meetings = [m for m in meetings if m["date"] == today]
+            resp = format_meetings_list(today_meetings, f"📅 *היום ({today}):*")
+            # הוסף תזכורות חד פעמיות של היום
+            today_reminders = [rem for rem in reminders
+                               if not rem.get("sent") and rem.get("fire_at", "").startswith(today)]
+            if today_reminders:
+                resp += "\n\n⏰ *תזכורות להיום:*"
+                for rem in today_reminders:
+                    time_part = rem["fire_at"].split(" ")[1] if " " in rem["fire_at"] else ""
+                    resp += f"\n🔔 {time_part} - {rem['text']}"
 
         elif action == "list_tomorrow":
             tomorrow = (now + timedelta(days=1)).strftime("%d/%m/%Y")
@@ -602,7 +660,7 @@ async def send_reminders(context: ContextTypes.DEFAULT_TYPE):
             meeting_dt = ISRAEL_TZ.localize(meeting_dt)
             diff = (meeting_dt - now).total_seconds() / 60
 
-            if not meeting.get("reminded") and 110 <= diff <= 130:
+            if not meeting.get("reminded") and 119 <= diff <= 121:
                 msg = f"🔔 *תזכורת!*\n\nבעוד שעתיים:\n📋 *{meeting['subject']}*\n🕐 {meeting['time']}"
                 if meeting.get("location"):
                     msg += f"\n📍 {meeting['location']}"
@@ -611,7 +669,7 @@ async def send_reminders(context: ContextTypes.DEFAULT_TYPE):
                 changed = True
 
             extra = int(meeting.get("extra_reminder_minutes", 0))
-            if extra > 0 and not meeting.get("extra_reminded") and (extra - 3) <= diff <= (extra + 3):
+            if extra > 0 and not meeting.get("extra_reminded") and (extra - 1) <= diff <= (extra + 1):
                 msg = f"🔔 *תזכורת!*\n\nבעוד {extra} דקות:\n📋 *{meeting['subject']}*\n🕐 {meeting['time']}"
                 if meeting.get("location"):
                     msg += f"\n📍 {meeting['location']}"
@@ -633,7 +691,7 @@ async def send_reminders(context: ContextTypes.DEFAULT_TYPE):
         try:
             fire_at = datetime.strptime(reminder["fire_at"], "%d/%m/%Y %H:%M")
             fire_at = ISRAEL_TZ.localize(fire_at)
-            if abs((fire_at - now).total_seconds()) <= 90:
+            if abs((fire_at - now).total_seconds()) <= 60:
                 msg = f"🔔 *תזכורת!*\n\n{reminder['text']}"
                 await context.bot.send_message(chat_id=int(reminder["user_id"]), text=msg, parse_mode="Markdown")
                 reminder["sent"] = True
